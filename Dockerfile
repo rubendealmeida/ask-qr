@@ -15,6 +15,5 @@ ENV PORT=3000
 # QR codes em producao (fica gravado dentro da imagem do QR).
 ENV BASE_URL=http://localhost:3000
 
-VOLUME ["/app/data", "/app/uploads"]
 EXPOSE 3000
 CMD ["node", "server.js"]
