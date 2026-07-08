@@ -11,7 +11,7 @@ const { dashboardPage, createPage } = require('./views');
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const UPLOADS_DIR = path.join(__dirname, 'data', 'uploads');
 const QR_IMAGES_DIR = path.join(__dirname, 'data', 'qrcodes');
 const LOGOS_DIR = path.join(__dirname, 'data', 'logos');
 [UPLOADS_DIR, QR_IMAGES_DIR, LOGOS_DIR].forEach(ensureDir);
