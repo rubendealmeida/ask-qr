@@ -32,4 +32,17 @@ CREATE TABLE IF NOT EXISTS scan_events (
 );
 `);
 
+// migracoes leves: adicionar colunas de analitica se ainda nao existirem
+const scanCols = db.prepare('PRAGMA table_info(scan_events)').all().map((c) => c.name);
+for (const [col, type] of [
+  ['ip', 'TEXT'],
+  ['country', 'TEXT'],
+  ['city', 'TEXT'],
+  ['device', 'TEXT'],
+]) {
+  if (!scanCols.includes(col)) {
+    db.exec(`ALTER TABLE scan_events ADD COLUMN ${col} ${type}`);
+  }
+}
+
 module.exports = db;

@@ -35,6 +35,12 @@ const QRApp = (() => {
     const previewLoading = document.getElementById('previewLoading');
     const errorEl = document.getElementById('formError');
     const submitBtn = document.getElementById('submitBtn');
+    const logoScaleField = document.getElementById('logoScaleField');
+    const logoScaleInput = document.getElementById('logoScale');
+    const logoScaleValue = document.getElementById('logoScaleValue');
+    const meterVerdict = document.getElementById('meterVerdict');
+    const meterFill = document.getElementById('meterFill');
+    const meterHint = document.getElementById('meterHint');
 
     let currentType = 'link';
     let currentShape = 'classico';
@@ -63,14 +69,37 @@ const QRApp = (() => {
     logoInput.addEventListener('change', async () => {
       if (logoInput.files[0]) {
         logoBase64 = await fileToBase64(logoInput.files[0]);
+        logoScaleField.hidden = false;
       } else {
         logoBase64 = null;
+        logoScaleField.hidden = true;
       }
       triggerPreview();
     });
 
+    logoScaleInput.addEventListener('input', () => {
+      logoScaleValue.textContent = logoScaleInput.value + '%';
+      debouncedPreview();
+    });
+
     [fgColor, bgColor].forEach(el => el.addEventListener('input', () => triggerPreview()));
+    const debouncedPreview = debounce(() => triggerPreview(), 300);
     urlInput.addEventListener('input', debounce(() => triggerPreview(), 400));
+
+    function renderMeter(data) {
+      if (!data || typeof data.level === 'undefined') return;
+      const cfg = {
+        alta: { text: 'Alta ✓', width: '100%', color: 'var(--ok, #3ecf8e)', hint: 'Perfeito — lê-se facilmente em qualquer telemóvel.' },
+        media: { text: 'Média', width: '55%', color: '#f5a623', hint: 'Lê-se, mas o contraste é baixo — em impressões pequenas ou má luz pode falhar.' },
+        baixa: { text: 'Baixa ✗', width: '20%', color: '#ff6b6b', hint: 'Um leitor real NÃO conseguiu ler este QR. Aumenta o contraste ou reduz o logótipo.' },
+      };
+      const c = cfg[data.level] || cfg.baixa;
+      meterVerdict.textContent = c.text;
+      meterVerdict.style.color = c.color;
+      meterFill.style.width = c.width;
+      meterFill.style.background = c.color;
+      meterHint.textContent = c.hint;
+    }
 
     async function triggerPreview() {
       previewLoading.hidden = false;
@@ -82,6 +111,7 @@ const QRApp = (() => {
           fg: fgColor.value,
           bg: bgColor.value,
           logoBase64,
+          logoScale: logoBase64 ? Number(logoScaleInput.value) / 100 : undefined,
         };
         const res = await fetch('/api/preview', {
           method: 'POST',
@@ -92,6 +122,7 @@ const QRApp = (() => {
         if (data.pngBase64) {
           previewImg.src = 'data:image/png;base64,' + data.pngBase64;
         }
+        renderMeter(data);
       } catch (e) {
         // silencioso: a pre-visualizacao e apenas cosmetica
       } finally {
@@ -113,6 +144,7 @@ const QRApp = (() => {
         fg: fgColor.value,
         bg: bgColor.value,
         logoBase64,
+        logoScale: logoBase64 ? Number(logoScaleInput.value) / 100 : undefined,
       };
 
       if (currentType === 'link') {
@@ -150,16 +182,36 @@ const QRApp = (() => {
   function initDashboard() {
     const modal = document.getElementById('editModal');
     const input = document.getElementById('editDestInput');
+    const pdfInput = document.getElementById('editPdfInput');
     const cancelBtn = document.getElementById('editCancel');
     const saveBtn = document.getElementById('editSave');
+    const tabLink = document.getElementById('editTabLink');
+    const tabPdf = document.getElementById('editTabPdf');
+    const panelLink = document.getElementById('editPanelLink');
+    const panelPdf = document.getElementById('editPanelPdf');
+    const errorEl = document.getElementById('editError');
     let editingId = null;
+    let editType = 'link';
+
+    function setEditType(t) {
+      editType = t;
+      tabLink.classList.toggle('active', t === 'link');
+      tabPdf.classList.toggle('active', t === 'pdf');
+      panelLink.hidden = t !== 'link';
+      panelPdf.hidden = t !== 'pdf';
+      errorEl.textContent = '';
+    }
+    tabLink.addEventListener('click', () => setEditType('link'));
+    tabPdf.addEventListener('click', () => setEditType('pdf'));
 
     document.querySelectorAll('[data-action="edit"]').forEach(btn => {
       btn.addEventListener('click', () => {
         editingId = btn.dataset.id;
         input.value = btn.dataset.current || '';
+        pdfInput.value = '';
+        setEditType(btn.dataset.type === 'pdf' ? 'pdf' : 'link');
         modal.classList.add('open');
-        input.focus();
+        if (editType === 'link') input.focus();
       });
     });
 
@@ -167,20 +219,37 @@ const QRApp = (() => {
     modal.addEventListener('click', (e) => { if (e.target === modal) modal.classList.remove('open'); });
 
     saveBtn.addEventListener('click', async () => {
-      if (!editingId || !input.value) return;
+      if (!editingId) return;
+      errorEl.textContent = '';
+      const payload = { type: editType };
+
+      if (editType === 'link') {
+        if (!input.value) { errorEl.textContent = 'Indica um link.'; return; }
+        payload.destination = input.value.trim();
+      } else {
+        const file = pdfInput.files[0];
+        if (!file) { errorEl.textContent = 'Escolhe um ficheiro PDF.'; return; }
+        if (file.size > 15 * 1024 * 1024) { errorEl.textContent = 'O PDF excede 15 MB.'; return; }
+        payload.pdfBase64 = await fileToBase64(file);
+        payload.pdfFilename = file.name;
+      }
+
       saveBtn.disabled = true;
+      saveBtn.textContent = 'A guardar…';
       try {
         const res = await fetch('/api/qrcodes/' + editingId, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ destination: input.value.trim() }),
+          body: JSON.stringify(payload),
         });
-        if (!res.ok) throw new Error('Falha ao guardar');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Falha ao guardar');
         window.location.reload();
       } catch (e) {
-        alert(e.message);
+        errorEl.textContent = e.message;
       } finally {
         saveBtn.disabled = false;
+        saveBtn.textContent = 'Guardar';
       }
     });
 

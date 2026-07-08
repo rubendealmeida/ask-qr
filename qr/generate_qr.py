@@ -110,7 +110,7 @@ def draw_finder_eye(draw, x0, y0, module_px, color, shape):
     draw.rounded_rectangle([c0, y0 + 2 * module_px, c1, y0 + size - 2 * module_px], radius=inner_round, fill=color)
 
 
-def render(matrix, n, style, out_path, logo_path=None, box=680):
+def render(matrix, n, style, out_path, logo_path=None, box=680, logo_scale=0.22):
     shape = style.get("shape", "classico")
     fg = hex_to_rgb(style.get("fg", "#111111"))
     bg = hex_to_rgb(style.get("bg", "#ffffff"))
@@ -171,7 +171,8 @@ def render(matrix, n, style, out_path, logo_path=None, box=680):
     # logotipo central (opcional)
     if logo_path and os.path.exists(logo_path):
         logo = Image.open(logo_path).convert("RGBA")
-        target = int(img_size * 0.22)
+        logo_scale = max(0.10, min(0.38, logo_scale))
+        target = int(img_size * logo_scale)
         logo.thumbnail((target, target), Image.LANCZOS)
         pad = int(target * 0.18)
         plate_w, plate_h = logo.width + pad * 2, logo.height + pad * 2
@@ -193,13 +194,14 @@ def main():
     p.add_argument("--fg", default="#111111")
     p.add_argument("--bg", default="#ffffff")
     p.add_argument("--logo", default=None)
+    p.add_argument("--logo-scale", type=float, default=0.22)
     p.add_argument("--box", type=int, default=680)
     args = p.parse_args()
 
     ec_level = "H" if args.logo else "Q"
     matrix, n = encode_matrix(args.text, ec_level=ec_level)
     style = {"shape": args.shape, "fg": args.fg, "bg": args.bg}
-    render(matrix, n, style, args.out, logo_path=args.logo, box=args.box)
+    render(matrix, n, style, args.out, logo_path=args.logo, box=args.box, logo_scale=args.logo_scale)
     print(f"OK modules={n} out={args.out}")
 
 

@@ -1,12 +1,13 @@
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { URL } = require('url');
 
 const db = require('./db');
-const { uniqueShortCode, nowISO, generateQrPng, ensureDir } = require('./utils');
-const { dashboardPage, createPage } = require('./views');
+const { uniqueShortCode, nowISO, generateQrPng, ensureDir, decodeQrPng, contrastRatio } = require('./utils');
+const { dashboardPage, createPage, analyticsPage } = require('./views');
 
 const PORT = process.env.PORT || 3000;
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
@@ -125,6 +126,8 @@ async function handlePreview(req, res) {
     ? body.url
     : `${BASE_URL}/r/PREVIEW`;
 
+  const logoScale = Math.max(0.10, Math.min(0.38, parseFloat(body.logoScale) || 0.22));
+
   const tmpOut = path.join('/tmp', `preview_${crypto.randomBytes(6).toString('hex')}.png`);
   let tmpLogo = null;
   try {
@@ -132,9 +135,24 @@ async function handlePreview(req, res) {
       tmpLogo = path.join('/tmp', `logo_${crypto.randomBytes(6).toString('hex')}.png`);
       fs.writeFileSync(tmpLogo, Buffer.from(body.logoBase64, 'base64'));
     }
-    generateQrPng({ text, shape, fg, bg, logoPath: tmpLogo, outPath: tmpOut, box: 420 });
+    generateQrPng({ text, shape, fg, bg, logoPath: tmpLogo, outPath: tmpOut, box: 420, logoScale });
     const png = fs.readFileSync(tmpOut);
-    sendJson(res, 200, { pngBase64: png.toString('base64') });
+
+    // medidor de legibilidade: tenta mesmo descodificar o PNG com um leitor real
+    const decoded = decodeQrPng(tmpOut);
+    const contrast = contrastRatio(fg, bg);
+    let level;
+    if (!decoded) level = 'baixa';
+    else if (contrast >= 4) level = 'alta';
+    else if (contrast >= 2.5) level = 'media';
+    else level = 'baixa';
+
+    sendJson(res, 200, {
+      pngBase64: png.toString('base64'),
+      scannable: decoded,
+      contrast: Math.round(contrast * 10) / 10,
+      level,
+    });
   } catch (e) {
     sendJson(res, 500, { error: 'falha ao gerar pre-visualizacao' });
   } finally {
@@ -195,10 +213,17 @@ async function handleCreate(req, res) {
     hasLogo = 1;
   }
 
+  const logoScale = Math.max(0.10, Math.min(0.38, parseFloat(body.logoScale) || 0.22));
   const redirectTarget = `${BASE_URL}/r/${code}`;
   const qrOut = path.join(QR_IMAGES_DIR, `${code}.png`);
   try {
-    generateQrPng({ text: redirectTarget, shape, fg, bg, logoPath, outPath: qrOut, box: 900 });
+    generateQrPng({ text: redirectTarget, shape, fg, bg, logoPath, outPath: qrOut, box: 900, logoScale });
+    // seguranca final: garante que o QR gerado e mesmo descodificavel
+    if (!decodeQrPng(qrOut)) {
+      fs.unlinkSync(qrOut);
+      if (logoPath && fs.existsSync(logoPath)) fs.unlinkSync(logoPath);
+      return sendJson(res, 400, { error: 'Com estas cores/logótipo o QR code deixa de ser lível. Aumenta o contraste ou reduz o logótipo.' });
+    }
   } catch (e) {
     return sendJson(res, 500, { error: 'Falha ao gerar o QR code.' });
   }
@@ -218,16 +243,114 @@ async function handlePatch(req, res, id) {
   try {
     body = await readJsonBody(req);
   } catch (e) {
+    if (e.code === 'PAYLOAD_TOO_LARGE') return sendJson(res, 413, { error: 'Ficheiro demasiado grande.' });
     return sendJson(res, 400, { error: 'corpo invalido' });
   }
   const row = db.prepare('SELECT * FROM qrcodes WHERE id = ?').get(id);
   if (!row) return sendJson(res, 404, { error: 'não encontrado' });
-  if (row.type !== 'link') return sendJson(res, 400, { error: 'só é possível editar o destino de QR codes de link' });
-  if (!isValidHttpUrl(body.destination || '')) return sendJson(res, 400, { error: 'link inválido' });
 
-  db.prepare('UPDATE qrcodes SET destination = ?, updated_at = ? WHERE id = ?')
-    .run(body.destination.trim(), nowISO(), id);
+  const newType = body.type === 'pdf' ? 'pdf' : body.type === 'link' ? 'link' : row.type;
+  const pdfPath = path.join(UPLOADS_DIR, `${row.code}.pdf`);
+
+  if (newType === 'pdf') {
+    // substituir/definir o PDF — o QR code impresso continua igual
+    if (!body.pdfBase64) return sendJson(res, 400, { error: 'Falta o ficheiro PDF.' });
+    const pdfBuf = Buffer.from(body.pdfBase64, 'base64');
+    if (pdfBuf.length > 15 * 1024 * 1024) return sendJson(res, 413, { error: 'PDF excede 15 MB.' });
+    if (pdfBuf.slice(0, 5).toString('utf8') !== '%PDF-') {
+      return sendJson(res, 400, { error: 'O ficheiro não parece ser um PDF válido.' });
+    }
+    fs.writeFileSync(pdfPath, pdfBuf);
+    const fname = (body.pdfFilename || 'ficheiro.pdf').slice(0, 200);
+    db.prepare('UPDATE qrcodes SET type = ?, destination = ?, original_filename = ?, updated_at = ? WHERE id = ?')
+      .run('pdf', `/files/${row.code}.pdf`, fname, nowISO(), id);
+  } else {
+    // destino passa a ser um link — se antes era PDF, o ficheiro deixa de ser preciso
+    if (!isValidHttpUrl(body.destination || '')) return sendJson(res, 400, { error: 'link inválido' });
+    if (row.type === 'pdf' && fs.existsSync(pdfPath)) {
+      try { fs.unlinkSync(pdfPath); } catch {}
+    }
+    db.prepare('UPDATE qrcodes SET type = ?, destination = ?, original_filename = NULL, updated_at = ? WHERE id = ?')
+      .run('link', body.destination.trim(), nowISO(), id);
+  }
   sendJson(res, 200, { ok: true });
+}
+
+// ---------- Analitica ----------
+
+function isPrivateIp(ip) {
+  if (!ip) return true;
+  return (
+    ip === '::1' ||
+    ip.startsWith('127.') ||
+    ip.startsWith('10.') ||
+    ip.startsWith('192.168.') ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(ip) ||
+    ip.startsWith('fc') ||
+    ip.startsWith('fe80')
+  );
+}
+
+function geoLookup(ip, scanEventId) {
+  if (isPrivateIp(ip)) return;
+  try {
+    const req = https.get(
+      { hostname: 'ipwho.is', path: `/${encodeURIComponent(ip)}?fields=success,country,city`, timeout: 4000 },
+      (resp) => {
+        let data = '';
+        resp.on('data', (c) => { data += c; if (data.length > 65536) resp.destroy(); });
+        resp.on('end', () => {
+          try {
+            const j = JSON.parse(data);
+            if (j && j.success) {
+              db.prepare('UPDATE scan_events SET country = ?, city = ? WHERE id = ?')
+                .run(j.country || null, j.city || null, scanEventId);
+            }
+          } catch {}
+        });
+      }
+    );
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => {});
+  } catch {}
+}
+
+function deviceFromUa(ua) {
+  if (/ipad|tablet/i.test(ua)) return 'Tablet';
+  if (/mobi|android|iphone/i.test(ua)) return 'Telemóvel';
+  return 'Computador';
+}
+
+function getStats(qrcodeId) {
+  const total = db.prepare('SELECT COUNT(*) c FROM scan_events WHERE qrcode_id = ?').get(qrcodeId).c;
+  const last7 = db.prepare(
+    "SELECT COUNT(*) c FROM scan_events WHERE qrcode_id = ? AND scanned_at >= datetime('now','-7 days')"
+  ).get(qrcodeId).c;
+  const lastScan = db.prepare(
+    'SELECT scanned_at FROM scan_events WHERE qrcode_id = ? ORDER BY id DESC LIMIT 1'
+  ).get(qrcodeId);
+  const perDayRows = db.prepare(
+    "SELECT date(scanned_at) d, COUNT(*) c FROM scan_events WHERE qrcode_id = ? AND scanned_at >= date('now','-29 days') GROUP BY date(scanned_at)"
+  ).all(qrcodeId);
+  const byDay = {};
+  perDayRows.forEach((r) => { byDay[r.d] = r.c; });
+  const perDay = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+    perDay.push({ date: d, count: byDay[d] || 0 });
+  }
+  const byCountry = db.prepare(
+    "SELECT COALESCE(country, 'Desconhecido') k, COUNT(*) c FROM scan_events WHERE qrcode_id = ? GROUP BY k ORDER BY c DESC LIMIT 12"
+  ).all(qrcodeId).map((r) => ({ label: r.k, count: r.c }));
+  const byDevice = db.prepare(
+    "SELECT COALESCE(device, 'Desconhecido') k, COUNT(*) c FROM scan_events WHERE qrcode_id = ? GROUP BY k ORDER BY c DESC"
+  ).all(qrcodeId).map((r) => ({ label: r.k, count: r.c }));
+  const recent = db.prepare(
+    'SELECT scanned_at, country, city, device FROM scan_events WHERE qrcode_id = ? ORDER BY id DESC LIMIT 12'
+  ).all(qrcodeId).map((r) => ({
+    scannedAt: r.scanned_at, country: r.country, city: r.city, device: r.device,
+  }));
+  return { total, last7, lastScan: lastScan ? lastScan.scanned_at : null, perDay, byCountry, byDevice, recent };
 }
 
 function handleArchive(req, res, id) {
@@ -241,12 +364,21 @@ function handleRedirect(req, res, code) {
   const row = db.prepare('SELECT * FROM qrcodes WHERE code = ? AND archived = 0').get(code);
   if (!row) { sendHtml(res, 404, '<h1>QR code não encontrado</h1>'); return; }
 
+  const ip = ((req.headers['x-forwarded-for'] || '').split(',')[0].trim()) ||
+    (req.socket && req.socket.remoteAddress) || '';
+  const device = deviceFromUa(req.headers['user-agent'] || '');
+
   db.prepare('UPDATE qrcodes SET scans = scans + 1 WHERE id = ?').run(row.id);
-  db.prepare('INSERT INTO scan_events (qrcode_id, scanned_at) VALUES (?, ?)').run(row.id, nowISO());
+  const ins = db.prepare(
+    'INSERT INTO scan_events (qrcode_id, scanned_at, ip, device) VALUES (?, ?, ?, ?)'
+  ).run(row.id, nowISO(), ip || null, device);
 
   const dest = row.type === 'pdf' ? `${BASE_URL}${row.destination}` : row.destination;
   res.writeHead(302, { Location: dest });
   res.end();
+
+  // geolocalizacao em segundo plano (nunca atrasa o redirecionamento)
+  setImmediate(() => geoLookup(ip, Number(ins.lastInsertRowid)));
 }
 
 function handleFile(req, res, code) {
@@ -296,6 +428,16 @@ const server = http.createServer(async (req, res) => {
     let m;
     if (method === 'PATCH' && (m = p.match(/^\/api\/qrcodes\/([^/]+)$/))) {
       return await handlePatch(req, res, m[1]);
+    }
+    if (method === 'GET' && (m = p.match(/^\/analytics\/([^/]+)$/))) {
+      const row = db.prepare('SELECT * FROM qrcodes WHERE id = ?').get(m[1]);
+      if (!row) return sendHtml(res, 404, '<h1>QR code não encontrado</h1>');
+      return sendHtml(res, 200, analyticsPage(row, BASE_URL, getStats(row.id)));
+    }
+    if (method === 'GET' && (m = p.match(/^\/api\/qrcodes\/([^/]+)\/stats$/))) {
+      const row = db.prepare('SELECT id FROM qrcodes WHERE id = ?').get(m[1]);
+      if (!row) return sendJson(res, 404, { error: 'não encontrado' });
+      return sendJson(res, 200, getStats(row.id));
     }
     if (method === 'POST' && (m = p.match(/^\/api\/qrcodes\/([^/]+)\/archive$/))) {
       return handleArchive(req, res, m[1]);
