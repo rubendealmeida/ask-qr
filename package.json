@@ -1,0 +1,14 @@
+{
+  "name": "qr-facil",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Plataforma simples de QR codes (links e PDFs) com estilos, logotipo central e leituras contabilizadas.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
